@@ -55,9 +55,44 @@ const failingFetch = (message: string) =>
     throw new Error(message);
   });
 
+/**
+ * A test-harness failure, as opposed to an assertion failure: the code under
+ * test never produced what the test needs to inspect. Without it, a missing
+ * call surfaces as "Cannot read properties of undefined (reading '0')", which
+ * says nothing about which mock or which call was expected.
+ */
+class HarnessError extends Error {
+  override name = 'HarnessError';
+}
+
+type AnyMock = { mock: { calls: unknown[][] } };
+
+/** The arguments of the nth call to a mock, or a HarnessError naming it. */
+function callArgs<M extends AnyMock>(fn: M, label: string, n = 0): M['mock']['calls'][number] {
+  const calls = fn.mock.calls;
+  if (n >= calls.length) {
+    throw new HarnessError(
+      `expected ${label} to have been called at least ${n + 1} time(s), got ${calls.length}`,
+    );
+  }
+  return calls[n];
+}
+
+/** The error the SDK handed to onError on its nth report. */
+const reportedError = (onError: AnyMock, n = 0) => callArgs(onError, 'onError', n)[0];
+
 /** The body of the nth request the mock received. */
-const bodyOf = (fetchImpl: ReturnType<typeof okFetch>, n = 0) =>
-  JSON.parse(fetchImpl.mock.calls[n][1]?.body as string);
+function bodyOf(fetchImpl: ReturnType<typeof okFetch>, n = 0) {
+  const body = callArgs(fetchImpl, 'fetch', n)[1]?.body;
+  if (typeof body !== 'string') {
+    throw new HarnessError(`fetch call ${n} had a ${typeof body} body, expected a JSON string`);
+  }
+  try {
+    return JSON.parse(body);
+  } catch (cause) {
+    throw new HarnessError(`fetch call ${n} body is not JSON: ${body.slice(0, 80)}`, { cause });
+  }
+}
 
 /** The x402 header, as the middleware finds it: base64 JSON. */
 const settleHeader = (result: Record<string, unknown>) =>
@@ -96,6 +131,10 @@ async function runHook(
 afterEach(() => {
   vi.useRealTimers();
   vi.restoreAllMocks();
+  // Several tests stub fetch, crypto, process or Buffer. If one fails before
+  // its own cleanup runs, the stub would leak and fail every later test for a
+  // reason unrelated to what it checks.
+  vi.unstubAllGlobals();
 });
 
 describe('toSettleHookPayload', () => {
@@ -117,17 +156,15 @@ describe('reportSettlement', () => {
   it('reports loudly when signing is unavailable', async () => {
     const onError = vi.fn();
     const fetchImpl = okFetch();
-    const originalImport = globalThis.crypto;
+    // Restored by the top-level afterEach, even if an assertion below fails.
     vi.stubGlobal('crypto', {
       subtle: { importKey: vi.fn().mockRejectedValue(new Error('unsupported')) },
     });
     vi.stubGlobal('process', undefined);
     vi.stubGlobal('Buffer', undefined);
     await expect(reportSettlement(settlement, opts({ fetchImpl, onError }))).resolves.toBe(false);
-    expect(String(onError.mock.calls[0][0])).toContain('Ed25519 signing unavailable');
+    expect(String(reportedError(onError))).toContain('Ed25519 signing unavailable');
     expect(fetchImpl).not.toHaveBeenCalled();
-    vi.stubGlobal('crypto', originalImport);
-    vi.unstubAllGlobals();
   });
 
   it('posts the signed payload to the settle endpoint', async () => {
@@ -135,7 +172,7 @@ describe('reportSettlement', () => {
     const result = await reportSettlement(settlement, opts({ fetchImpl }));
 
     expect(result).toBe(true);
-    const [url, init] = fetchImpl.mock.calls[0] as unknown as [string, RequestInit];
+    const [url, init] = callArgs(fetchImpl, 'fetch') as unknown as [string, RequestInit];
     expect(url).toBe(`https://accensa.test${SETTLE_ENDPOINT}`);
     expect(init.method).toBe('POST');
     // The report is authenticated by an Ed25519 signature over the exact body
@@ -151,7 +188,7 @@ describe('reportSettlement', () => {
   it('does not double the slash when indexerUrl has a trailing one', async () => {
     const fetchImpl = okFetch();
     await reportSettlement(settlement, opts({ fetchImpl, indexerUrl: 'https://accensa.test/' }));
-    expect(fetchImpl.mock.calls[0][0]).toBe(`https://accensa.test${SETTLE_ENDPOINT}`);
+    expect(callArgs(fetchImpl, 'fetch')[0]).toBe(`https://accensa.test${SETTLE_ENDPOINT}`);
   });
 
   it('never logs the private key on signing failure', async () => {
@@ -162,15 +199,19 @@ describe('reportSettlement', () => {
     await expect(reportSettlement(settlement, options)).resolves.toBe(false);
 
     expect(onError).toHaveBeenCalledOnce();
-    const errorStr = String(onError.mock.calls[0][0]);
+    const errorStr = String(reportedError(onError));
     expect(errorStr).not.toContain(veryBadKeyHex);
 
     // Also test fallback console.error
     const consoleSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
-    const optionsFallback = opts({ privateKeyHex: 'def', onError: undefined });
+    // A sentinel that cannot appear by accident ('def' matches "undefined").
+    const fallbackKeyHex = 'c0ffee';
+    const optionsFallback = opts({ privateKeyHex: fallbackKeyHex, onError: undefined });
     await expect(reportSettlement(settlement, optionsFallback)).resolves.toBe(false);
-    expect(String(consoleSpy.mock.calls[0][0])).not.toContain('def');
-    expect(String(consoleSpy.mock.calls[0][2])).not.toContain('def');
+    // Check every argument of the log line, not fixed indices: an index past
+    // the end stringifies to "undefined" and would pass vacuously.
+    const logged = callArgs(consoleSpy, 'console.error');
+    for (const arg of logged) expect(String(arg)).not.toContain(fallbackKeyHex);
   });
 
   it('reports a non-2xx response as a failure without throwing', async () => {
@@ -178,18 +219,18 @@ describe('reportSettlement', () => {
     const fetchImpl = vi.fn(async () => new globalThis.Response(null, { status: 401 }));
 
     await expect(reportSettlement(settlement, opts({ fetchImpl, onError }))).resolves.toBe(false);
-    const reported = onError.mock.calls[0][0];
+    const reported = reportedError(onError);
     expect(reported).toBeInstanceOf(AccensaAuthError);
     expect(reported).toBeInstanceOf(AccensaError);
     expect(reported).toMatchObject({ status: 401, path: SETTLE_ENDPOINT });
     expect(String(reported)).toContain('401');
-    expect(onError.mock.calls[0][0]).toBeInstanceOf(Error);
-    expect(String(onError.mock.calls[0][0])).toContain('401');
-    expect(String(onError.mock.calls[0][0])).not.toContain(PRIVATE_KEY_HEX);
+    expect(reportedError(onError)).toBeInstanceOf(Error);
+    expect(String(reportedError(onError))).toContain('401');
+    expect(String(reportedError(onError))).not.toContain(PRIVATE_KEY_HEX);
     // A 4xx means the request itself is wrong (#123) — it must not be retried.
     expect(fetchImpl).toHaveBeenCalledOnce();
     // The payload comes back with the error so a caller can retry or log it.
-    const payload = onError.mock.calls[0][1];
+    const payload = callArgs(onError, 'onError')[1];
     const expected = toSettleHookPayload(settlement);
     expect(payload).toEqual({ ...expected, reported_at: payload.reported_at });
   });
@@ -199,7 +240,7 @@ describe('reportSettlement', () => {
     const fetchImpl = vi.fn(async () => new globalThis.Response(null, { status: 500 }));
 
     await expect(reportSettlement(settlement, opts({ fetchImpl, onError }))).resolves.toBe(false);
-    const reported = onError.mock.calls[0][0];
+    const reported = reportedError(onError);
     expect(reported).toBeInstanceOf(AccensaError);
     expect(reported).not.toBeInstanceOf(AccensaAuthError);
     expect(reported).toMatchObject({ status: 500 });
@@ -212,9 +253,8 @@ describe('reportSettlement', () => {
     const onError = vi.fn();
 
     await expect(reportSettlement(settlement, opts({ onError }))).resolves.toBe(false);
-    expect(onError.mock.calls[0][0]).toBeInstanceOf(AccensaNetworkError);
-    expect(String(onError.mock.calls[0][0])).toContain('No fetch implementation');
-    vi.unstubAllGlobals();
+    expect(reportedError(onError)).toBeInstanceOf(AccensaNetworkError);
+    expect(String(reportedError(onError))).toContain('No fetch implementation');
   });
 
   it('wraps a rejected fetch in AccensaNetworkError with the URL and cause', async () => {
@@ -222,7 +262,7 @@ describe('reportSettlement', () => {
     const fetchImpl = failingFetch('ECONNREFUSED');
 
     await expect(reportSettlement(settlement, opts({ fetchImpl, onError }))).resolves.toBe(false);
-    const reported = onError.mock.calls[0][0] as AccensaNetworkError;
+    const reported = reportedError(onError) as AccensaNetworkError;
     expect(reported).toBeInstanceOf(AccensaNetworkError);
     expect(reported.url).toBe(`https://accensa.test${SETTLE_ENDPOINT}`);
     expect(String(reported.cause)).toContain('ECONNREFUSED');
@@ -234,7 +274,6 @@ describe('reportSettlement', () => {
 
     await expect(reportSettlement(settlement, opts())).resolves.toBe(true);
     expect(spy).toHaveBeenCalledOnce();
-    vi.unstubAllGlobals();
   });
 
   it('falls back to console.error when no onError is supplied', async () => {
@@ -289,7 +328,7 @@ describe('reportSettlement — retry (#123)', () => {
     expect(result).toBe(false);
     // The initial attempt plus 3 retries.
     expect(fetchImpl).toHaveBeenCalledTimes(4);
-    expect(String(onError.mock.calls[0][0])).toContain('503');
+    expect(String(reportedError(onError))).toContain('503');
   });
 
   it('retries a dropped connection the same way as a 5xx', async () => {
@@ -348,7 +387,7 @@ describe('reportSettlement — network timeout', () => {
     expect(result).toBe(false);
     expect(onError).toHaveBeenCalledOnce();
     // The abort surfaces as a network error carrying the AbortError as cause.
-    const reported = onError.mock.calls[0][0] as AccensaNetworkError;
+    const reported = reportedError(onError) as AccensaNetworkError;
     expect(reported).toBeInstanceOf(AccensaNetworkError);
     expect(reported.cause).toBeInstanceOf(DOMException);
     expect((reported.cause as DOMException).name).toBe('AbortError');
@@ -357,7 +396,7 @@ describe('reportSettlement — network timeout', () => {
   it('passes an abort signal to fetch', async () => {
     const fetchImpl = hangingFetch();
     await reportSettlement(settlement, opts({ fetchImpl, timeoutMs: 5, onError: vi.fn() }));
-    expect(fetchImpl.mock.calls[0][1]?.signal).toBeInstanceOf(AbortSignal);
+    expect(callArgs(fetchImpl, 'fetch')[1]?.signal).toBeInstanceOf(AbortSignal);
   });
 
   it('defaults to a five second timeout', async () => {
@@ -491,8 +530,9 @@ describe('attachAccensaHook', () => {
       },
     });
 
-    expect(() => runHook(middleware, fakeReq(), fakeRes(paid))).not.toThrow();
-    await new Promise((resolve) => setImmediate(resolve));
+    // runHook is async, so a synchronous not.toThrow() would never observe a
+    // rejection — it would float as an unhandled rejection instead. Await it.
+    await expect(runHook(middleware, fakeReq(), fakeRes(paid))).resolves.toBeDefined();
     expect(onError).toHaveBeenCalled();
     expect(fetchImpl).not.toHaveBeenCalled();
   });
